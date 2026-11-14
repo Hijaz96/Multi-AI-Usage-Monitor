@@ -1,5 +1,36 @@
 # Multi-AI Usage Monitor v3.1.0
 
+<!-- SCREENSHOT_GALLERY_START -->
+## Screenshots
+
+See Multi-AI Usage Monitor in action on KDE Plasma 5.
+
+### Dashboard and token analytics
+
+| Main dashboard | Token analytics and controls |
+|:---:|:---:|
+| ![Multi-AI Monitor dashboard](screenshots/dashboard.png) | ![Token usage analytics](screenshots/token-analytics.png) |
+
+### Responsive widget layouts
+
+| Extra small | Small |
+|:---:|:---:|
+| ![Extra-small widget](screenshots/widget-xs.png) | ![Small widget](screenshots/widget-small.png) |
+
+| Medium | Large |
+|:---:|:---:|
+| ![Medium widget](screenshots/widget-medium.png) | ![Large widget](screenshots/widget-large.png) |
+
+### Settings and customization
+
+| Numbers | Bars | Rings |
+|:---:|:---:|:---:|
+| ![Numbers meter style](screenshots/settings-numbers.png) | ![Bars meter style](screenshots/settings-bars.png) | ![Rings meter style](screenshots/settings-rings.png) |
+
+> Screenshots show example quota and token usage values. Claude and Custom API options are marked as coming soon.
+<!-- SCREENSHOT_GALLERY_END -->
+
+
 KDE Plasma 5 widget for Codex account quota and local token analytics.
 
 ## Features
