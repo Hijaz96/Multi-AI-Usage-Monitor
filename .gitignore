@@ -1,0 +1,7 @@
+*.bak*
+*.broken*
+__pycache__/
+*.pyc
+.codex/
+.agents/
+.git/

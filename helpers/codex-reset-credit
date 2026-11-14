@@ -1,0 +1,232 @@
+#!/usr/bin/env python3
+import fcntl
+import json
+import os
+import select
+import subprocess
+import sys
+import time
+import uuid
+from pathlib import Path
+
+HOME = Path.home()
+STATE_DIR = HOME / ".local/state/codex-usage-widget"
+LOCK_FILE = STATE_DIR / "reset.lock"
+PENDING_FILE = STATE_DIR / "pending-reset.json"
+CODEX = Path("/usr/lib/chatgpt/resources/codex")
+COOLDOWN_FILE = STATE_DIR / "reset-cooldown.json"
+COOLDOWN_SECONDS = 60 * 60
+
+def cooldown_remaining():
+    if not COOLDOWN_FILE.exists():
+        return 0
+    data = json.loads(COOLDOWN_FILE.read_text())
+    return max(0, int(data["until"] - time.time()))
+
+def save_cooldown():
+    temp = STATE_DIR / "reset-cooldown.tmp"
+    with temp.open("w") as f:
+        json.dump({"until": time.time() + COOLDOWN_SECONDS}, f)
+        f.flush()
+        os.fsync(f.fileno())
+    os.chmod(temp, 0o600)
+    os.replace(temp, COOLDOWN_FILE)
+
+
+def output(status, message):
+    print(json.dumps({
+        "status": status,
+        "message": message
+    }), flush=True)
+
+def save_pending(key):
+    temp = STATE_DIR / "pending-reset.tmp"
+    with temp.open("w") as f:
+        json.dump({
+            "idempotencyKey": key,
+            "status": "uncertain",
+            "createdAt": int(time.time())
+        }, f)
+        f.flush()
+        os.fsync(f.fileno())
+    os.chmod(temp, 0o600)
+    os.replace(temp, PENDING_FILE)
+
+def receive(proc, request_id):
+    deadline = time.monotonic() + 25
+    buffer = b""
+
+    while time.monotonic() < deadline:
+        ready, _, _ = select.select([proc.stdout], [], [], 0.5)
+        if not ready:
+            if proc.poll() is not None:
+                raise RuntimeError("Codex server exited")
+            continue
+
+        chunk = os.read(proc.stdout.fileno(), 65536)
+        if not chunk:
+            raise RuntimeError("Codex server disconnected")
+
+        buffer += chunk
+
+        while b"\n" in buffer:
+            line, buffer = buffer.split(b"\n", 1)
+            if not line.strip():
+                continue
+
+            message = json.loads(line)
+            if message.get("id") != request_id:
+                continue
+
+            if "error" in message:
+                raise RuntimeError(str(message["error"]))
+
+            return message.get("result", {})
+
+    raise TimeoutError("Codex server timeout")
+
+def send(proc, payload):
+    proc.stdin.write(
+        (json.dumps(payload) + "\n").encode("utf-8")
+    )
+    proc.stdin.flush()
+
+def main():
+    args = sys.argv[1:]
+
+    if args == ["--status"]:
+        if PENDING_FILE.exists():
+            output("uncertain",
+                   "Previous reset outcome unresolved. New reset blocked.")
+        else:
+            remaining = cooldown_remaining()
+            if remaining > 0:
+                output("cooldown",
+                       f"Reset available in {remaining // 60 + 1} minutes.")
+            else:
+                output("ready", "No unresolved reset attempt.")
+        return
+
+    if args != ["--confirm"]:
+        output("safe", "No reset performed")
+        return
+
+    if not CODEX.is_file():
+        output("error", "Codex CLI not found")
+        return
+
+    STATE_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chmod(STATE_DIR, 0o700)
+
+    with LOCK_FILE.open("a+") as lock:
+        try:
+            fcntl.flock(
+                lock.fileno(),
+                fcntl.LOCK_EX | fcntl.LOCK_NB
+            )
+        except BlockingIOError:
+            output("busy", "Another reset attempt is running.")
+            return
+
+        if PENDING_FILE.exists():
+            output(
+                "uncertain",
+                "Previous attempt unresolved. No new credit requested."
+            )
+            return
+
+        remaining = cooldown_remaining()
+        if remaining > 0:
+            output("cooldown",
+                   f"Reset available in {remaining // 60 + 1} minutes.")
+            return
+
+        proc = None
+        request_sent = False
+
+        try:
+            proc = subprocess.Popen(
+                [str(CODEX), "app-server"],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                bufsize=0
+            )
+
+            send(proc, {
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "clientInfo": {
+                        "name": "kde-codex-reset",
+                        "version": "1.7"
+                    },
+                    "capabilities": {}
+                }
+            })
+
+            receive(proc, 1)
+            send(proc, {
+                "method": "initialized",
+                "params": {}
+            })
+
+            key = str(uuid.uuid4())
+
+            # Save before sending anything that can consume a credit.
+            save_pending(key)
+
+            request_sent = True
+            send(proc, {
+                "id": 2,
+                "method": "account/rateLimitResetCredit/consume",
+                "params": {
+                    "idempotencyKey": key
+                }
+            })
+
+            result = receive(proc, 2)
+            outcome = result.get("outcome")
+
+            messages = {
+                "reset": "Reset successful. One credit consumed.",
+                "nothingToReset": "No eligible window to reset.",
+                "noCredit": "No reset credit available.",
+                "alreadyRedeemed": "Attempt already redeemed."
+            }
+
+            if outcome in messages:
+                if outcome in ("reset", "alreadyRedeemed"):
+                    save_cooldown()
+                PENDING_FILE.unlink(missing_ok=True)
+                output(outcome, messages[outcome])
+            else:
+                output(
+                    "uncertain",
+                    "Unknown response. Further resets blocked."
+                )
+
+        except Exception:
+            if request_sent:
+                output(
+                    "uncertain",
+                    "Reset result uncertain. Further resets blocked. "
+                    "Check usage and credits before recovery."
+                )
+            else:
+                # No consume request was attempted.
+                PENDING_FILE.unlink(missing_ok=True)
+                output("error", "Could not initialize Codex App Server.")
+
+        finally:
+            if proc is not None:
+                if proc.poll() is None:
+                    proc.terminate()
+                try:
+                    proc.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait()
+
+if __name__ == "__main__":
+    main()
